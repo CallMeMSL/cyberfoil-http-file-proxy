@@ -1,0 +1,20 @@
+{
+  "name": "cyberfoil-http-file-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run",
+    "dev": "wrangler dev --ip 127.0.0.1",
+    "deploy": "wrangler deploy",
+    "profile": "SHOP_PROFILE=1 node --test --test-name-pattern='local CPU profile' tests/shop.test.mjs",
+    "test": "npm run build && node --test tests/shop.test.mjs"
+  },
+  "engines": { "node": ">=22" },
+  "devDependencies": {
+    "miniflare": "5.20260908.0-alpha",
+    "wrangler": "4.130.0"
+  },
+  "overrides": {
+    "sharp": "0.35.4"
+  }
+}

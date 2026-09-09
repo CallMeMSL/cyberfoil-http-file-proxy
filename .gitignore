@@ -1,0 +1,10 @@
+/target/
+/build/
+/.wrangler/
+/node_modules/
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+*.local.json

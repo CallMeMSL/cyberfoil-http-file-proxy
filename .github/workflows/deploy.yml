@@ -1,0 +1,86 @@
+name: Test and Deploy Worker
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WRANGLER_SEND_METRICS: "false"
+  CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+
+jobs:
+  test:
+    name: Validate Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target wasm32-unknown-unknown
+          rustup default 1.98.1
+      - name: Install locked dependencies
+        run: |
+          npm ci
+          cargo install worker-build --version 0.8.5 --locked
+      - name: Check Rust
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo check --target wasm32-unknown-unknown --locked
+      - name: Build and test compiled Worker
+        run: npm test
+
+  deploy:
+    name: Deploy Production
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    concurrency:
+      group: cloudflare-production
+      cancel-in-progress: false
+    steps:
+      - name: Check out tested source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target wasm32-unknown-unknown
+          rustup default 1.98.1
+      - name: Install locked dependencies
+        run: |
+          npm ci
+          cargo install worker-build --version 0.8.5 --locked
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
+            echo "Configure CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in the production environment."
+            exit 1
+          fi
+          npm run deploy

@@ -41,6 +41,10 @@ struct Item {
     name: String,
     size: u64,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon_url: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -71,10 +75,16 @@ impl FolderResponse {
                 {
                     return Err(CatalogError::InvalidItem);
                 }
+                let title_id = title_id_from_name(&entry.name);
+                let icon_url = title_id
+                    .as_ref()
+                    .map(|title_id| format!("/api/shop/icon/{title_id}"));
                 Ok(Item {
                     name: entry.name,
                     size: entry.size.ok_or(CatalogError::InvalidItem)?,
                     url: link,
+                    title_id,
+                    icon_url,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -93,6 +103,24 @@ impl FolderResponse {
     }
 }
 
+fn title_id_from_name(name: &str) -> Option<String> {
+    let mut found: Option<&str> = None;
+    for block in name.as_bytes().windows(18) {
+        if block[0] != b'[' || block[17] != b']' || !block[1..17].is_ascii() {
+            continue;
+        }
+        if !block[1..17].iter().all(u8::is_ascii_hexdigit) {
+            continue;
+        }
+        let candidate = std::str::from_utf8(&block[1..17]).ok()?;
+        if found.is_some_and(|previous| !previous.eq_ignore_ascii_case(candidate)) {
+            return None;
+        }
+        found = Some(candidate);
+    }
+    found.map(str::to_ascii_uppercase)
+}
+
 fn is_installable(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(stem, extension)| {
         !stem.is_empty()
@@ -106,6 +134,81 @@ fn is_installable(name: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn title_ids_are_independent_of_other_filename_metadata() {
+        for name in [
+            "Game [010055D009F78000][v0].nsp",
+            "Game [010055d009f78000][v0].nsz",
+            "Game+[010055D009F78000][v0][US].XCI",
+            "Game [DLC broken [010055D009F78000]v196608].nsp",
+            "Game [010055D009F78000] (3.04 GB).xcz",
+            "Game [010055D009F78000][010055d009f78000].nsp",
+        ] {
+            assert_eq!(
+                title_id_from_name(name).as_deref(),
+                Some("010055D009F78000"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_invalid_and_ambiguous_title_ids_are_omitted() {
+        for name in [
+            "Game.nsp",
+            "Game 010055D009F78000.nsp",
+            "Game [v196608][DLC].nsp",
+            "Game [010055D009F7800].nsp",
+            "Game [010055D009F780000].nsp",
+            "Game [010055D009F7800G].nsp",
+            "Game [010055D009F78000.nsp",
+            "Game [010055D009F78000][010055D009F78800].nsp",
+        ] {
+            assert_eq!(title_id_from_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn icon_metadata_preserves_file_ids_and_duplicate_title_entries() {
+        let names = [
+            "Game [010055d009f78800][v196608].nsp",
+            "Game [DLC][010055D009F79001].nsp",
+            "Game [010055D009F78000].nsp",
+            "Game [Language Pack][010055D009F78000].nsz",
+        ];
+        let entries: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                json!({"type": "file", "name": name, "size": 5000000000u64,
+                    "link": format!("https://cdn.example/{index}?token=a%2Fb")})
+            })
+            .collect();
+        let response: FolderResponse = serde_json::from_value(json!({
+            "status": "success", "content": entries,
+        }))
+        .unwrap();
+        let catalog = serde_json::to_value(response.into_catalog("switch").unwrap()).unwrap();
+        let items = catalog["sections"][0]["items"].as_array().unwrap();
+        assert_eq!(items.len(), names.len());
+        for (index, title_id) in [
+            "010055D009F78800",
+            "010055D009F79001",
+            "010055D009F78000",
+            "010055D009F78000",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(
+                items[index],
+                json!({"name": names[index], "size": 5000000000u64,
+                    "url": format!("https://cdn.example/{index}?token=a%2Fb"),
+                    "title_id": title_id, "icon_url": format!("/api/shop/icon/{title_id}")})
+            );
+        }
+    }
 
     #[test]
     fn catalog_preserves_direct_links_and_sizes_and_ignores_subfolders() {

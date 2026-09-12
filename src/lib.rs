@@ -1,5 +1,6 @@
 mod auth;
 mod catalog;
+mod icons;
 mod premiumize;
 
 use serde::Serialize;
@@ -59,14 +60,19 @@ impl ShopError {
 }
 
 #[event(fetch)]
-async fn fetch(request: Request, _env: Env, _context: Context) -> Result<Response> {
-    if !matches!(request.path().as_str(), "/" | "/api/shop/sections") {
+async fn fetch(request: Request, _env: Env, context: Context) -> Result<Response> {
+    let path = request.path();
+    let icon_id = path.strip_prefix("/api/shop/icon/");
+    if !matches!(path.as_str(), "/" | "/api/shop/sections") && icon_id.is_none() {
         return error_response("Not found", 404);
     }
     if request.method() != Method::Get {
         let mut response = error_response("Method not allowed", 405)?;
         response.headers_mut().set("Allow", "GET")?;
         return Ok(response);
+    }
+    if let Some(icon_id) = icon_id {
+        return icons::serve(&request, icon_id, &context).await;
     }
     match serve_catalog(&request).await {
         Ok(catalog) => json_response(&catalog, 200),

@@ -2,7 +2,7 @@
 
 A Rust Cloudflare Worker using [workers-rs](https://github.com/cloudflare/workers-rs) to expose one Premiumize cloud folder as a Cyberfoil shop.
 
-The Worker serves **catalog JSON only**. Cyberfoil downloads files directly from the HTTPS links returned by Premiumize. No file bytes, download redirects, or range requests pass through this Worker.
+The Worker serves **catalog JSON and public game icons**. Cyberfoil downloads installable files directly from the HTTPS links returned by Premiumize. No game-file bytes, download redirects, or range requests pass through this Worker.
 
 See [technical documentation](spec/proxy.md) for the architecture and implementation contract, and [GitHub Actions deployment](#github-actions-deployment) for automated hosting.
 
@@ -14,8 +14,9 @@ See [technical documentation](spec/proxy.md) for the architecture and implementa
 - Empty usernames, dot segments, repeated interior slashes, backslashes and control characters are rejected. A colon cannot be part of a Basic-auth username.
 - Only files directly inside the selected folder are included. Subfolders are ignored, without recursion.
 - Supported extensions: `.nsp`, `.nsz`, `.xci`, `.xcz`, case-insensitively. Other files are ignored.
-- Each item contains only `name`, `size` in bytes and `url`. Filenames, API order, 64-bit file sizes and signed download URLs are preserved. Missing or invalid metadata for an eligible file fails the catalog instead of returning a broken item.
-- There is no title-ID parsing, cover service, metadata database, save sync, upload API or frontend. Unsupported paths return `404`; non-GET methods on catalog paths return `405`.
+- Each item contains `name`, `size` in bytes and `url`, plus optional `title_id` and `icon_url` extracted from the filename. Filenames, API order, 64-bit file sizes and signed download URLs are preserved. Missing or invalid size/link metadata for an eligible file fails the catalog instead of returning a broken item.
+- `GET /api/shop/icon/{TITLEID}` serves public icons without Premiumize authentication. It never accesses the account or forwards client credentials.
+- There is no metadata database, save sync, upload API or frontend. Unsupported paths return `404`; non-GET methods on catalog and icon routes return `405`.
 
 Every authenticated catalog request makes exactly one request to:
 
@@ -25,6 +26,27 @@ Authorization: Bearer <api-key>
 ```
 
 For the root folder, the `path` parameter is omitted. Download links come from the documented `link` field, not from HTML directory scraping or per-file API calls. An empty folder produces a successful empty section. API error envelopes are checked even when Premiumize returns HTTP 200.
+
+## Game Icons
+
+An exact `[16 hexadecimal characters]` block in an installable filename supplies its title ID. For example, `Game [010055d009f78000][v0].nsp` gains these fields:
+
+```json
+{
+  "title_id": "010055D009F78000",
+  "icon_url": "/api/shop/icon/010055D009F78000"
+}
+```
+
+IDs are normalized to uppercase. Other tags, plus signs, Unicode names and damaged brackets outside the ID block do not interfere. If no valid block exists, or distinct IDs conflict, both optional fields are omitted and the file remains installable. Repeated copies of the same ID are accepted. Files sharing an ID, including language packs, remain separate entries. The filename is a hint, not verification of package contents; app type and version are not emitted.
+
+Cyberfoil requests the icon from this Worker, which fetches only `https://tinfoil.media/thi/{TITLEID}/0/0/`. **Do not replace the relative icon URL with a direct image-host URL:** the [current Cyberfoil image downloader](https://github.com/luketanti/CyberFoil/blob/master/source/util/curl.cpp) sends configured shop credentials to the image URL without an origin check. The Worker creates a fresh credential-free request, follows no redirects, and discards upstream cookies and other non-image response headers.
+
+Updates (IDs ending in `800`) use the base-game image. DLCs use their own image first, then the base-game image if the source returns `404` or `500`; this source was observed returning `500` for an unavailable image. This changes only the image lookup, never the catalog's file title ID. There are at most two source requests within one six-second deadline, with a two-MiB limit per image. Only JPEG, PNG and WebP MIME types with matching signatures are accepted; JPEG also requires its end marker. Images are not decoded or resized by the Worker. Missing, invalid or unavailable images do not break catalog loading or downloads.
+
+Successful images are publicly cached for 24 hours using Cloudflare's Cache API. Keys contain only the shop origin and normalized image ID, not credentials or query parameters; updates share their base game's cache entry. Failed images are not cached, and cache failures do not fail an otherwise successful image response. No storage binding or additional secret is required. The public endpoint consumes Worker request allowance, including cache hits; it has no account validation or dedicated rate limiter.
+
+After deploying, refresh the shop and check both preview and grid view. `shopStartGridMode` can open the grid by default on clients using the documented shop settings. Title IDs may also activate Cyberfoil's installed-content filters and related-update prompts; test language packs and updates as well as base games. Cyberfoil maintains its own SD-card icon cache, so a wrong previously cached image may need to be removed there separately. Image availability for every title is not guaranteed.
 
 ## Setup
 
@@ -146,6 +168,8 @@ Cloudflare hosting and GitHub Actions have separate allowances. Standard hosted 
 
 For rollback, select a known-good version in the Cloudflare Worker's deployment history, or revert the bad change through a reviewed commit on `main` so the workflow redeploys it. GitHub secrets and token rotation are managed in account settings, not this repository.
 
+The icon update uses this same deployment workflow and Worker URL, without new Cloudflare bindings or secrets. After validation and deployment, verify a base-game icon, an update icon and a DLC icon before repeating a console installation. Rollback does not clear Cyberfoil's SD-card icon cache.
+
 ## Cyberfoil Profile
 
 Use the deployed host, HTTPS, port 443 and an empty shop URL path. The storage folder belongs in **username**, not in the shop URL path. Replace the example password locally; never commit the real profile.
@@ -173,12 +197,12 @@ Cloudflare's [limits](https://developers.cloudflare.com/workers/platform/limits/
 | --- | --- | --- |
 | Inbound requests | 100,000 per day per account | One invocation per catalog or other incoming request; direct downloads do not invoke it |
 | CPU | 10 ms per invocation | Minimal typed JSON conversion; network waiting does not count as CPU |
-| Subrequests | 50 per invocation | One API fetch; no internal retries or redirect following |
-| Memory | 128 MB per isolate, shared across concurrent requests | Upstream catalog body limited to 4 MiB, including responses without Content-Length |
+| Subrequests | 50 per invocation | Catalog: one API fetch. Icon: zero on cache hit, otherwise one source fetch plus at most one DLC fallback; no redirects |
+| Memory | 128 MB per isolate, shared across concurrent requests | Catalog body limited to 4 MiB; each icon body limited to 2 MiB, including streamed responses |
 
-The complete upstream fetch, including reading its body, has a 20-second deadline, below Cyberfoil's documented 30-second catalog timeout. Client retries remain Cyberfoil's responsibility. No KV, D1, R2, Durable Objects, scheduled jobs or Cache API are used. Catalogs and errors use `Cache-Control: private, no-store`; outbound API caching is disabled. There is no persistent credential or catalog storage.
+The complete upstream catalog fetch, including reading its body, has a 20-second deadline, below Cyberfoil's documented 30-second catalog timeout. Icon source requests and bodies share a six-second deadline. Client retries remain Cyberfoil's responsibility. No KV, D1, R2, Durable Objects or scheduled jobs are used. The Cache API stores only public images; catalogs and errors use `Cache-Control: private, no-store`, and outbound fetch caching is disabled. There is no persistent credential or catalog storage.
 
-The 1,000-file test fixture, with long filenames and signed URLs, produces approximately 375 KB of JSON. A local release-Wasm inspector run measured about 7.4 ms of sampled active execution per warmed request, versus about 8.6 ms before removing redundant JSON buffering. The deployment dry run reported approximately 556 KiB uncompressed and 205 KiB gzipped. These are local observations, **not a guarantee of deployed CPU accounting, cold-start performance or a supported maximum folder size**. The 4 MiB input bound is a memory safeguard, not a promise that every such listing fits the CPU limit.
+The 1,000-file test fixture, with long filenames, signed URLs and icon metadata, produces 468,847 bytes of JSON. The icon-enabled deployment dry run reported approximately 587 KiB uncompressed and 215 KiB gzipped. A warmed local profile measured about 9.3 ms active time per request with the new metadata, close to the Free CPU allowance; the historical 7.4 ms estimate did not include it. These are local observations, **not a guarantee of deployed CPU accounting, cold-start performance or a supported maximum folder size**. The 4 MiB input bound is a memory safeguard, not a promise that every such listing fits the CPU limit.
 
 Measure your actual catalog in the deployed Worker's metrics. If CPU limits are exceeded, select a smaller folder and inspect CPU usage before adding caching or upgrading plans. The request allowance is account-wide, includes rejected requests, and can be exhausted by public traffic. A Free-plan Worker becomes unavailable when its quota is exceeded; this project does not upgrade your plan. Premiumize subscription and traffic limits are separate from Cloudflare hosting.
 
@@ -191,10 +215,10 @@ Errors contain a stable English `error` field. Upstream bodies, raw exceptions a
 | `400` | Invalid folder syntax or Premiumize rejected the folder request |
 | `401` | Missing, malformed or invalid credentials; includes a Basic challenge |
 | `403` | Premiumize denied access |
-| `404` | Folder not found, or the requested route is not implemented |
-| `405` | Unsupported method; catalog routes allow GET only |
+| `404` | Folder or icon not found, malformed icon ID, or unsupported route |
+| `405` | Unsupported method; catalog and icon routes allow GET only |
 | `429` | Premiumize rate, account or service quota reached |
-| `502` | Network failure, unexpected redirect, invalid API data/link or oversized listing |
+| `502` | Network failure, unexpected redirect, invalid API data/link, oversized listing, or unavailable/invalid/oversized icon |
 | `503` | Premiumize unavailable |
 | `504` | Upstream deadline or upstream timeout |
 
@@ -207,7 +231,7 @@ A syntactically valid upstream `Retry-After` is preserved for quota/unavailabili
 - Catalog links must be absolute HTTPS URLs without embedded username/password or literal whitespace. Their signed tokens are sensitive: do not share catalog output, local profiles or diagnostic headers. The Worker trusts the download destinations returned by Premiumize, does not probe them, and does not restrict them to one particular CDN hostname.
 - According to the supplied Cyberfoil documentation, **Cyberfoil forwards Basic credentials to download URLs** and disables certificate verification for shop requests. Those client behaviors cannot be changed by this shop-only Worker. Use a trusted client/network and understand that Premiumize/CDN download endpoints can receive the full API key in the client's Basic header. HTTPS configuration alone does not restore a client's disabled certificate verification.
 - `dir.premiumize.me/<api-key>/...` URLs are intentionally not generated: they place the full account key into URL paths. This implementation uses Premiumize's returned file links instead.
-- Premiumize link expiration or IP binding is not specified in the supplied documentation. No cache reduces stale-link risk but cannot guarantee a link generated from a Cloudflare IP will work later from the console. Refresh the shop to obtain fresh links. If direct-link compatibility fails, investigate a shop-only alternative rather than introducing download proxying.
+- Premiumize link expiration or IP binding is not specified in the supplied documentation. Uncached catalogs reduce stale-link risk but cannot guarantee a link generated from a Cloudflare IP will work later from the console. Refresh the shop to obtain fresh links. If direct-link compatibility fails, investigate a shop-only alternative rather than introducing download proxying.
 - Application code does not log requests, credentials or upstream failures. Persistent Workers observability is disabled in Wrangler configuration. Cloudflare and Premiumize still process the requests; do not assume an absence of provider-side logging or enable verbose tracing with real credentials casually.
 
 ## Verification
@@ -223,7 +247,7 @@ npm test
 npm run profile
 ```
 
-`npm test` builds the actual JS/Wasm bundle and tests it in Miniflare with intercepted outbound requests. It covers authentication, both shop routes, path encoding, credential isolation, direct URLs, large sizes, malformed data, HTTP-200 API errors, redirects, quotas, oversized streams, a 1,000-file listing and the real 20-second body deadline. It never contacts Premiumize. The optional profile test is skipped during normal tests.
+`npm test` builds the actual JS/Wasm bundle and tests it in Miniflare with intercepted outbound requests. It covers authentication, both shop routes, filename title IDs, credential isolation, direct URLs, large sizes, malformed data, HTTP-200 API errors, redirects, quotas, oversized streams and a 1,000-file listing. Icon coverage includes header stripping, public cache isolation, base/update/DLC mapping, invalid media and the real six-second body deadline; catalog tests exercise the real 20-second deadline. It never contacts Premiumize or tinfoil.media. The optional profile test is skipped during normal tests.
 
 `npm run profile` requires an existing build, as produced by `npm test` or `npm run build`. It uses a local inspector and 30 warmed 1,000-file requests. Reported sampled active time excludes idle/program samples and is only a local estimate; inspector memory figures are not a complete measurement of Cloudflare's per-isolate accounting. The profile script uses POSIX environment-variable syntax.
 
@@ -243,8 +267,9 @@ These require your own credentials and console and have not been established by 
 2. Check a known folder, an explicitly selected nested folder and a nonexistent path. Confirm Premiumize resolves `path` as documented and never silently substitutes the root for a missing folder.
 3. From the console's network, request a small range from a returned direct URL using `Range: bytes=0-1023` and `Accept-Encoding: identity`. Verify HTTP `206`, the expected `Content-Range`, and exactly 1,024 bytes. Keep the signed URL private. Repeat after a realistic catalog-to-download delay.
 4. After deployment, load the catalog and test an installation in Cyberfoil. Verify downloads go directly to Premiumize and produce no download invocations on the Worker. Check actual CPU metrics and cold requests before relying on Free-plan hosting.
+5. Refresh the catalog and check base, update, DLC and language-pack icons in preview and grid view. Confirm the image endpoint works without Basic credentials and repeated requests can use the image cache. Check installed-title filters and related-install prompts after adding title metadata. If an old incorrect image persists, remove only the affected SD-card icon-cache entry and refresh.
 
-The implementation has not been deployed automatically and no real Premiumize account has been accessed during development.
+The original download flow has been reported working on the console. On September 12, 2026, a user-authorized local Wasm smoke test recognized title/icon metadata for all 75 files in `switch`. Base-game, update and DLC icon requests returned JPEGs with HTTP 200 using one Premiumize listing and two image-source requests; the update reused the cached base image. No credentials went to the image host and no game files were downloaded. This does not establish full image coverage or deployed Cloudflare behavior. Icon support still requires console acceptance after deployment, especially rendering and installed-content filtering.
 
 ## Protocol References
 

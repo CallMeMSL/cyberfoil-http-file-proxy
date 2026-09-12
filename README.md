@@ -106,7 +106,9 @@ npm run build
 npm run deploy
 ```
 
-`npm run build` is a deployment dry run and does not publish anything. `npm run deploy` does publish the Worker to your account. Wrangler prints its `https://cyberfoil-http-file-proxy.<subdomain>.workers.dev` URL. The worker name can be changed in [wrangler.toml](wrangler.toml).
+`npm run build` is a deployment dry run and does not publish anything. `npm run deploy` does publish the Worker to your account. Wrangler prints its `https://chfp.<subdomain>.workers.dev` URL. The worker name is configured in [wrangler.toml](wrangler.toml).
+
+Changing the Wrangler worker name creates a separate Cloudflare Worker rather than renaming the existing deployment in place. After deploying `chfp`, verify the new URL and update Cyberfoil. Manage the old `cyberfoil-http-file-proxy` Worker separately.
 
 ### GitHub Actions Deployment
 
@@ -152,7 +154,7 @@ Use the deployed host, HTTPS, port 443 and an empty shop URL path. The storage f
 {
   "shop": {
     "protocol": "https",
-    "host": "cyberfoil-http-file-proxy.<subdomain>.workers.dev",
+    "host": "chfp.<subdomain>.workers.dev",
     "path": "",
     "port": 443,
     "username": "Games/Switch",

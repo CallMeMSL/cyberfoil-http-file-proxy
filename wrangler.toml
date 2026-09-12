@@ -1,4 +1,4 @@
-name = "cyberfoil-http-file-proxy"
+name = "chfp"
 main = "build/index.js"
 compatibility_date = "2026-09-09"
 workers_dev = true
